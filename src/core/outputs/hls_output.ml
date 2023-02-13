@@ -136,13 +136,22 @@ type segment = {
   discontinuous : bool;
   current_discontinuity : int;
   filename : string;
+  mutable extra_tags : string list;
   mutable init_filename : string option;
   mutable out_channel : out_channel option;
   mutable len : int;
 }
 
 let json_of_segment
-    { id; discontinuous; current_discontinuity; filename; init_filename; len } =
+    {
+      id;
+      discontinuous;
+      current_discontinuity;
+      filename;
+      init_filename;
+      extra_tags;
+      len;
+    } =
   `Assoc
     [
       ("id", `Int id);
@@ -151,6 +160,7 @@ let json_of_segment
       ("filename", `String filename);
       ( "init_filename",
         match init_filename with Some f -> `String f | None -> `Null );
+      ("extra_tags", `Tuple (List.map (fun s -> `String s) extra_tags));
       ("len", `Int len);
     ]
 
@@ -162,8 +172,14 @@ let segment_of_json = function
         ("current_discontinuity", `Int current_discontinuity);
         ("filename", `String filename);
         ("init_filename", init_filename);
+        ("extra_tags", `Tuple extra_tags);
         ("len", `Int len);
       ] ->
+      let extra_tags =
+        List.map
+          (function `String t -> t | _ -> raise Invalid_state)
+          extra_tags
+      in
       let init_filename =
         match init_filename with
           | `String f -> Some f
@@ -177,6 +193,7 @@ let segment_of_json = function
         filename;
         init_filename;
         len;
+        extra_tags;
         out_channel = None;
       }
   | _ -> raise Invalid_state
@@ -515,12 +532,27 @@ class hls_output p =
           filename;
           init_filename =
             (match s.init_state with `Has_init f -> Some f | _ -> None);
+          extra_tags = [];
           out_channel = Some out_channel;
         }
       in
       s.current_segment <- Some segment;
       s.position <- s.position + 1;
       if discontinuous then s.discontinuity_count <- s.discontinuity_count + 1
+
+    method insert_tag =
+      self#mutexify (fun tag ->
+          List.iter
+            (fun s ->
+              match s.current_segment with
+                | None ->
+                    Lang.raise_error ~pos:[]
+                      ~message:
+                        "Cannot insert HLS extra segment at the moment. Is the \
+                         output running?"
+                      "hls"
+                | Some s -> s.extra_tags <- tag :: s.extra_tags)
+            streams)
 
     method private cleanup_streams =
       List.iter
@@ -591,7 +623,9 @@ class hls_output p =
                (Frame.seconds_of_main segment.len));
           output_string oc
             (Printf.sprintf "%s%s\r\n" prefix
-               (Filename.basename segment.filename)))
+               (Filename.basename segment.filename));
+          List.iter (output_string oc)
+            (self#mutexify (fun () -> segment.extra_tags) ()))
         segments;
 
       self#close_out ~filename oc
@@ -787,7 +821,24 @@ class hls_output p =
 let _ =
   let return_t = Lang.univ_t () in
   Lang.add_operator ~base:Pipe_output.output_file "hls" (hls_proto return_t)
-    ~return_t ~category:`Output ~meth:Output.meth
+    ~return_t ~category:`Output
+    ~meth:
+      ([
+         ( "insert_tag",
+           ([], Lang.fun_t [(false, "", Lang.string_t)] Lang.unit_t),
+           "Insert an arbitrary tags into the current position of the streams \
+            playlist. Raises `error.hls` if insertion fails, for instance if \
+            the output is not running.",
+           fun s ->
+             Lang.val_fun
+               [("", "", None)]
+               (fun p ->
+                 let tag = Lang.to_string (List.assoc "" p) in
+                 s#insert_tag tag;
+                 Lang.unit) );
+       ]
+      @ Output.meth ())
     ~descr:
       "Output the source stream to an HTTP live stream served from a local \
-       directory." (fun p -> (new hls_output p :> Output.output))
+       directory."
+    (fun p -> new hls_output p)
