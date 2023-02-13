@@ -220,6 +220,7 @@ type stream = {
   bandwidth : int Lazy.t;
   codecs : string Lazy.t;  (** codecs (see RFC 6381) *)
   extname : string;
+  mutable extra_tags : string list;
   mutable init_state : init_state;
   mutable init_position : int;
   mutable position : int;
@@ -407,6 +408,7 @@ class hls_output p =
         codecs;
         video_size;
         extname;
+        extra_tags = [];
         init_state = `Todo;
         init_position = 0;
         position = 1;
@@ -540,19 +542,25 @@ class hls_output p =
       s.position <- s.position + 1;
       if discontinuous then s.discontinuity_count <- s.discontinuity_count + 1
 
-    method insert_tag =
-      self#mutexify (fun tag ->
+    method insert_tag ~global tag =
+      self#mutexify
+        (fun () ->
+          let tag = String.trim tag in
           List.iter
             (fun s ->
-              match s.current_segment with
-                | None ->
-                    Lang.raise_error ~pos:[]
-                      ~message:
-                        "Cannot insert HLS extra segment at the moment. Is the \
-                         output running?"
-                      "hls"
-                | Some s -> s.extra_tags <- tag :: s.extra_tags)
+              if global then s.extra_tags <- tag :: s.extra_tags
+              else (
+                try
+                  self#close_segment s;
+                  self#open_segment s;
+                  let current_segment = Option.get s.current_segment in
+                  current_segment.extra_tags <-
+                    tag :: current_segment.extra_tags
+                with exn ->
+                  let bt = Printexc.get_raw_backtrace () in
+                  Lang.raise_as_runtime ~bt ~kind:"hls" exn))
             streams)
+        ()
 
     method private cleanup_streams =
       List.iter
@@ -599,6 +607,9 @@ class hls_output p =
            (int_of_float (ceil segment_duration)));
       output_string oc
         (Printf.sprintf "#EXT-X-VERSION:%d\r\n" (Lazy.force x_version));
+      List.iter
+        (fun s -> output_string oc (Printf.sprintf "%s\r\n" s))
+        (self#mutexify (fun () -> s.extra_tags) ());
       output_string oc
         (Printf.sprintf "#EXT-X-MEDIA-SEQUENCE:%d\r\n" media_sequence);
       output_string oc
@@ -621,11 +632,12 @@ class hls_output p =
           output_string oc
             (Printf.sprintf "#EXTINF:%.03f,\r\n"
                (Frame.seconds_of_main segment.len));
+          List.iter
+            (fun s -> output_string oc (Printf.sprintf "%s\r\n" s))
+            (self#mutexify (fun () -> segment.extra_tags) ());
           output_string oc
             (Printf.sprintf "%s%s\r\n" prefix
-               (Filename.basename segment.filename));
-          List.iter (output_string oc)
-            (self#mutexify (fun () -> segment.extra_tags) ()))
+               (Filename.basename segment.filename)))
         segments;
 
       self#close_out ~filename oc
@@ -703,11 +715,13 @@ class hls_output p =
       let streams =
         `Tuple
           (List.map
-             (fun { name; position; discontinuity_count } ->
+             (fun { name; position; discontinuity_count; extra_tags } ->
                `Assoc
                  [
                    ("name", `String name);
                    ("position", `Int position);
+                   ( "extra_tags",
+                     `Tuple (List.map (fun s -> `String s) extra_tags) );
                    ("discontinuity_count", `Int discontinuity_count);
                  ])
              streams)
@@ -737,9 +751,15 @@ class hls_output p =
                 [
                   ("name", `String name);
                   ("position", `Int position);
+                  ("extra_tags", `Tuple extra_tags);
                   ("discontinuity_count", `Int discontinuity_count);
                 ] ->
-                (name, position, discontinuity_count)
+                let extra_tags =
+                  List.map
+                    (function `String s -> s | _ -> raise Invalid_state)
+                    extra_tags
+                in
+                (name, position, extra_tags, discontinuity_count)
             | _ -> raise Invalid_state)
           (match saved_streams with `Tuple l -> l | _ -> raise Invalid_state)
       in
@@ -755,8 +775,9 @@ class hls_output p =
           | _ -> raise Invalid_state
       in
       List.iter2
-        (fun stream (name, pos, discontinuity_count) ->
+        (fun stream (name, pos, extra_tags, discontinuity_count) ->
           assert (name = stream.name);
+          stream.extra_tags <- extra_tags;
           stream.discontinuity_count <- discontinuity_count;
           stream.init_position <- pos;
           stream.position <- pos + 1)
@@ -808,8 +829,11 @@ class hls_output p =
         (Option.map
            (fun b ->
              Strings.iter (output_substring (Option.get out_channel)) b;
-             self#close_segment s;
-             self#open_segment s)
+             self#mutexify
+               (fun () ->
+                 self#close_segment s;
+                 self#open_segment s)
+               ())
            flushed);
       let { out_channel } = Option.get s.current_segment in
       Strings.iter (output_substring (Option.get out_channel)) data
@@ -825,19 +849,25 @@ let _ =
     ~meth:
       ([
          ( "insert_tag",
-           ([], Lang.fun_t [(false, "", Lang.string_t)] Lang.unit_t),
-           "Insert an arbitrary tags into the current position of the streams \
-            playlist. Raises `error.hls` if insertion fails, for instance if \
-            the output is not running.",
+           ( [],
+             Lang.fun_t
+               [(true, "global", Lang.bool_t); (false, "", Lang.string_t)]
+               Lang.unit_t ),
+           "Insert an arbitrary tags into the media streams playlist. If \
+            `global` is `true`, tag is inserted at the beginning of the \
+            playlist, before the segment list. Otherwise, the current segment \
+            is closed and the tag is attached to a fresh segment. Raises \
+            `error.hls` if insertion fails.",
            fun s ->
              Lang.val_fun
-               [("", "", None)]
+               [("global", "global", Some (Lang.bool false)); ("", "", None)]
                (fun p ->
+                 let global = Lang.to_bool (List.assoc "global" p) in
                  let tag = Lang.to_string (List.assoc "" p) in
-                 s#insert_tag tag;
+                 s#insert_tag ~global tag;
                  Lang.unit) );
        ]
-      @ Output.meth ())
+      @ Start_stop.meth ())
     ~descr:
       "Output the source stream to an HTTP live stream served from a local \
        directory."
