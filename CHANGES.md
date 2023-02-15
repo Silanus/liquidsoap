@@ -28,6 +28,7 @@ New:
   the value of a reference. Setting a reference can be done both by `x.set(v)`
   and `x := v`, which is still supported as a notation (#2881).
 - Added `ref.make` and `ref.map`.
+- Added `video.board`, `video.graph`, `video.info` (#2886).
 
 Changed:
 
@@ -79,6 +80,7 @@ Changed:
 - Added `settings.protocol.youtube_dl.timeout` to specify timeout when using
   `youtube-dl` protocol (#2827). Use `yt-dlp` as default binary for the
   protocol.
+- The `sleeper` operator is now scripted (#2899).
 
 Fixed:
 
