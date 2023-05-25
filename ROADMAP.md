@@ -43,6 +43,7 @@
   - we want to get rid of the assumption clock = thread
 - Take advantage of multicore
 - Support for proper modules
+- Signal mechanism for force certain source buffering w/o having to have huge default. e.g. crossfade tells sources it will expect ~10s of buffered data.
 - Optimize runtime: start time, typing and memory usage
 - Add script tooling, prettier etc.
 - Redefine switch-based transitions.
